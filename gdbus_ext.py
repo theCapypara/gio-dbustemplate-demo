@@ -5,7 +5,9 @@ This is temporary and will be contributed to PyGObject.
 from __future__ import annotations
 
 import os
-from functools import partial, partialmethod
+import sys
+import traceback
+from functools import partial, partialmethod, update_wrapper
 from typing import (
     Optional,
     Literal,
@@ -18,6 +20,7 @@ from typing import (
     Dict,
     List,
     Any,
+    Iterable,
 )
 
 from gi.repository import Gio, GLib
@@ -26,24 +29,17 @@ from gi.repository import Gio, GLib
 _DBusHandlerType = Union[
     Literal["method"],
     Literal["signal"],
-    Literal["property_get"],
-    Literal["property_set"],
+    Literal["property"],
 ]
-_NotUnique = None
-_InterfacesType = List[Gio.DBusInterfaceInfo]
-# outer key: interface name; inner key: method name
-_MethodsType = Dict[str, Dict[str, Tuple[Gio.DBusMethodInfo, Callable]]]
-# outer key: interface name; inner key: property name; tuple members: info, getter, setter
-_PropertiesType = Dict[
-    str,
-    Dict[str, Tuple[Gio.DBusPropertyInfo, Callable, Callable]],
-]
-_UniqueElementsType = Dict[str, Union[Gio.DBusInterfaceInfo, _NotUnique]]
 
 
 class DBusHandlerStandIn:
     def __init__(
-        self, typ: _DBusHandlerType, name: str, func: Callable, interface: Optional[str]
+        self,
+        typ: _DBusHandlerType,
+        name: str,
+        func: Callable,
+        interface: Optional[str],
     ):
         self.type = typ
         self.name = name
@@ -51,6 +47,75 @@ class DBusHandlerStandIn:
         self.interface = interface
 
 
+class DBusProperty(DBusHandlerStandIn):
+    def __init__(
+        self,
+        name: str,
+        func: Callable,
+        interface: Optional[str],
+        emit_changed: bool,
+        emit_with_value: bool,
+        setter_func: Optional[Callable] = None,
+    ):
+        super().__init__("property", name, func, interface)
+        self.emit_changed = emit_changed
+        self.emit_with_value = emit_with_value
+        self.setter_func = setter_func
+
+    def __repr__(self):
+        return f"<D-Bus Property {self.interface or '<uninitialized>'}.{self.name}>"
+
+    def __get__(self, instance: Optional[IsDecorated], klass):
+        if instance is None:
+            return self
+
+        return self.func(instance)
+
+    def __set__(self, instance: Optional[IsDecorated], value):
+        if instance is None:
+            raise TypeError
+
+        if self.setter_func is not None:
+            self.setter_func(instance, value)
+        else:
+            raise TypeError("this property is read-only")
+
+        properties = instance.__giodbustemplate__properties__
+        prop_info = properties[self.interface][self.name][0]
+        if self.emit_changed:
+            if self.emit_with_value:
+                emit_properties_changed(
+                    instance,
+                    self.interface,
+                    {self.name: GLib.Variant(prop_info.signature, value)},
+                    [],
+                )
+            else:
+                emit_properties_changed(instance, self.interface, {}, [self.name])
+
+    def getter(self, fget):
+        """Set the getter function to fget. For use as a decorator."""
+        if fget.__doc__:
+            self.__doc__ = fget.__doc__
+        self.func = fget
+        return self
+
+    def setter(self, fset):
+        """Set the setter function to fset. For use as a decorator."""
+        self.setter_func = fset
+        return self
+
+
+_NotUnique = None
+_InterfacesType = List[Gio.DBusInterfaceInfo]
+# outer key: interface name; inner key: method name
+_MethodsType = Dict[str, Dict[str, Tuple[Gio.DBusMethodInfo, Callable]]]
+# outer key: interface name; inner key: property name; tuple members: info, getter, setter
+_PropertiesType = Dict[
+    str,
+    Dict[str, Tuple[Gio.DBusPropertyInfo, DBusProperty]],
+]
+_UniqueElementsType = Dict[str, Union[Gio.DBusInterfaceInfo, _NotUnique]]
 _OpenPropsType = Dict[Tuple[str, str], DBusHandlerStandIn]
 
 
@@ -80,7 +145,7 @@ def generate_name(
 
 class Method:
     """
-    Decorator. Handler for a D-Bus method.
+    Decorator that declares a D-Bus method and defines a handler method for it.
 
     The method will be passed all the arguments used.
     It must return None when no out arguments are defined.
@@ -111,7 +176,7 @@ class Method:
 
 class Signal:
     """
-    Decorator. Emitter for a D-Bus signal.
+    Decorator that declares a signal and defines an emitter for a D-Bus signal.
 
     If `name` is not set, the name is generated to be the PascalCase version of the decorated
     method name.
@@ -142,14 +207,29 @@ class Signal:
         )
 
 
-class PropertyGet:
+class Property:
     """
-    Decorator. Decorated methods handle getting a property.
+    Decorator that declares a property.
+
+    Decorated methods handle getting a property. You can then use `@property_name.setter` (where property_name is
+    the original method name) on another method to declare it as the setter for that property.
+
+    When a property value changes via a setter, a `PropertiesChanged` signal is sent
+    (unless disabled via `emit_changed`).
+    When the property is changed internally, `DBusTemplate.properties_changed` can be used to emit
+    this signal manually.
 
     The decorated method must not have kwargs or keyword-only arguments.
     """
 
-    def __init__(self, name: Optional[str] = None, interface: Optional[str] = None):
+    def __init__(
+        self,
+        name: Optional[str] = None,
+        interface: Optional[str] = None,
+        *,
+        emit_changed: bool = True,
+        emit_with_value: bool = True,
+    ):
         """
         `name` is the name of the property.
         If `name` is not set, the name is generated to be the PascalCase version of the decorated
@@ -159,51 +239,23 @@ class PropertyGet:
         `interface` is the name of the interface that this method is defined on.
         This will usually be auto-detected based on the method name, however if
         there is a conflict it needs to be set manually.
+
+        If `emit_changed` is set to `False`, updates to this property will not be sent via `PropertiesChanged`.
+        If `emit_with_value` is set to `False`, the value will not be included in `PropertiesChanged` (it will be sent
+        as part of `invalidated_properties`.
         """
         self._name = name
         self._interface = interface
+        self._emit_changed = emit_changed
+        self._emit_with_value = emit_with_value
 
     def __call__(self, func):
-        return DBusHandlerStandIn(
-            "property_get",
-            generate_name(self._name, func, "get_"),
+        return DBusProperty(
+            generate_name(self._name, func),
             func,
             self._interface,
-        )
-
-
-class PropertySet:
-    """
-    Decorator. Decorated methods handle setting a property.
-
-    The decorated method must not have kwargs or keyword-only arguments.
-
-    Calling the setter, either from Python or remotely via D-Bus, will also emit the
-    `org.freedesktop.DBus.Properties.PropertiesChanged` signal.
-    """
-
-    pass
-
-    def __init__(self, name: Optional[str] = None, interface: Optional[str] = None):
-        """
-        `name` is the name of the property.
-        If `name` is not set, the name is generated to be the PascalCase version of the decorated
-        method name.
-        Any `set_` at the beginning of the decorated method name is removed before this is done.
-
-        `interface` is the name of the interface that this method is defined on.
-        This will usually be auto-detected based on the method name, however if
-        there is a conflict it needs to be set manually.
-        """
-        self._name = name
-        self._interface = interface
-
-    def __call__(self, func):
-        return DBusHandlerStandIn(
-            "property_set",
-            generate_name(self._name, func, "set_"),
-            func,
-            self._interface,
+            self._emit_changed,
+            self._emit_with_value,
         )
 
 
@@ -232,8 +284,13 @@ def on_method_call(
 
     try:
         result = method_func(obj, *args)
-    except ValueError as e:
+    except Exception as e:
         invocation.return_dbus_error(interface_name, str(e))
+        # If a debugger is attached, re-raise the Exception.
+        if getattr(sys, "gettrace", None) is not None:
+            raise e
+        else:
+            traceback.print_exc()
         return
 
     if not isinstance(result, tuple):
@@ -257,8 +314,8 @@ def on_get_property(
     property_name: str,
 ):
     properties = obj.__class__.__giodbustemplate__properties__
-    prop_info, getter, _setter = properties[interface_name][property_name]
-    value = getter(obj)
+    prop_info, prop = properties[interface_name][property_name]
+    value = prop.__get__(obj, obj.__class__)
     return GLib.Variant(prop_info.signature, value)
 
 
@@ -272,20 +329,8 @@ def on_set_property(
     value: GLib.Variant,
 ):
     properties = obj.__class__.__giodbustemplate__properties__
-    _prop_info, _getter, setter = properties[interface_name][property_name]
-    setter(obj, value.unpack())
-    # we emit the org.freedesktop.DBus.Properties.PropertiesChanged signal.
-    emit_signal(
-        obj,
-        "PropertiesChanged",
-        "org.freedesktop.DBus.Properties",
-        obj.__giodbustemplate__path__,
-        GLib.Variant.new_tuple(
-            GLib.Variant("s", interface_name),
-            GLib.Variant("a{sv}", {property_name: value}),
-            GLib.Variant("as", []),
-        ),
-    )
+    _prop_info, prop = properties[interface_name][property_name]
+    prop.__set__(obj, value.unpack())
     return True  # if setting failed, the setter would have raised an exception.
 
 
@@ -326,14 +371,23 @@ def emit_signal(
     )
 
 
-def not_supported_setter(*args):
-    raise TypeError("this property is read-only")
-
-
-def ent_name(standin: DBusHandlerStandIn):
-    if standin.type == "property_get" or standin.type == "property_set":
-        return "property"
-    return standin.type
+def emit_properties_changed(
+    obj: IsDecorated,
+    interface: str,
+    changed_properties: Dict[str, GLib.Variant],
+    invalidated_properties: List[str],
+):
+    emit_signal(
+        obj,
+        "PropertiesChanged",
+        "org.freedesktop.DBus.Properties",
+        obj.__giodbustemplate__path__,
+        GLib.Variant.new_tuple(
+            GLib.Variant("s", interface),
+            GLib.Variant("a{sv}", changed_properties),
+            GLib.Variant("as", invalidated_properties),
+        ),
+    )
 
 
 def process_standin(
@@ -343,20 +397,17 @@ def process_standin(
     infos: Dict[str, Dict[str, Any]],
     # not set for signals, we don't need to record them in the class, the partials themselves contain everything needed:
     runtime_def=None,
-    # only set if processing property getter or setter:
-    open_props: Optional[_OpenPropsType] = None,
 ) -> str:
     if standin.interface is not None:
         interface_name = standin.interface
     else:
         if standin.name not in unique:
             raise TypeError(
-                f"D-Bus {ent_name(standin)} {standin.name} not defined in any interface"
+                f"D-Bus {standin.type} {standin.name} not defined in any interface"
             )
         if unique[standin.name] is None:
-            type_name = ent_name(standin)
             raise TypeError(
-                f"Interface for D-Bus {type_name} {standin.name} could not be auto-detected since the {type_name} is defined in multiple interfaces. Specify the interface name manually"
+                f"Interface for D-Bus {standin.type} {standin.name} could not be auto-detected since the {standin.type} is defined in multiple interfaces. Specify the interface name manually"
             )
         interface_name = unique[standin.name].name
 
@@ -365,14 +416,14 @@ def process_standin(
 
     if standin.name not in infos[interface_name]:
         raise TypeError(
-            f"D-Bus {ent_name(standin)} {standin.name} not defined for interface {interface_name}"
+            f"D-Bus {standin.type} {standin.name} not defined for interface {interface_name}"
         )
 
     ident = (interface_name, standin.name)
 
     if ident not in unassigned:
         raise TypeError(
-            f"D-Bus {ent_name(standin)} {standin.name} has a handler method but is either not in the XML or there are multiple handlers defined for it in class"
+            f"D-Bus {standin.type} {standin.name} has a handler method but is either not in the XML or there are multiple handlers defined for it in class"
         )
 
     if runtime_def is not None:
@@ -380,40 +431,15 @@ def process_standin(
             runtime_def[interface_name] = {}
 
         info = infos[interface_name][standin.name]
-        if standin.type == "property_get" or standin.type == "property_set":
-            assert open_props is not None
-            if ident in open_props:
-                counterpart = open_props[ident]
-                if {counterpart.type, standin.type} != {"property_get", "property_set"}:
-                    raise TypeError(
-                        f"D-Bus {ent_name(standin)} {standin.name} has multiple getters and/or setters defined"
-                    )
-
-                if standin.type == "property_get":
-                    runtime_def[interface_name][standin.name] = (
-                        info,
-                        standin.func,
-                        counterpart.func,
-                    )
-                else:
-                    runtime_def[interface_name][standin.name] = (
-                        info,
-                        counterpart.func,
-                        standin.func,
-                    )
-
-                del open_props[ident]
-                unassigned.remove(ident)
-            else:
-                open_props[ident] = standin
+        if standin.type == "property":
+            assert isinstance(standin, DBusProperty)
+            runtime_def[interface_name][standin.name] = (info, standin)
         else:
             runtime_def[interface_name][standin.name] = (
                 info,
                 standin.func,
             )
-            unassigned.remove(ident)
-    else:
-        unassigned.remove(ident)
+    unassigned.remove(ident)
 
     return interface_name
 
@@ -450,8 +476,7 @@ class DBusTemplate:
 
     Method = Method
     Signal = Signal
-    PropertyGet = PropertyGet
-    PropertySet = PropertySet
+    Property = Property
 
     @classmethod
     def register_object(cls, connection: Gio.DBusConnection, name: str, path: str, obj):
@@ -479,6 +504,57 @@ class DBusTemplate:
                 get_property_closure=partial(on_get_property, obj),
                 set_property_closure=partial(on_set_property, obj),
             )
+
+    @classmethod
+    def properties_changed(cls, obj, interface: str, properties: Iterable[str]):
+        """
+        Mark the given properties as modified on `obj`, where `obj` is an object of a class annotated with `DBusTemplate`.
+        This will emit a `org.freedesktop.DBus.Properties.PropertiesChanged`.
+
+        This must not be called when the setter of a property was already called to modify that property, as doing this
+        will already emit the signal.
+        This can be useful for when read-only properties have changed or you can not call the usual property setter for
+        other reasons.
+
+        The `emit_changed` and `emit_with_value` settings of properties are still taken into consideration. This means
+        that if `emit_changed` is set to `False` for a property, it will not be included in the `PropertiesChanged`
+        signal evocation, even if it is included in `properties`.
+        """
+        if not hasattr(obj.__class__, "__giodbustemplate__interfaces__"):
+            raise TypeError(
+                "properties_changed must be called for object decorated with DBusTemplate"
+            )
+
+        infos = obj.__class__.__giodbustemplate__properties__
+        if interface not in infos:
+            raise TypeError(
+                f"The object does not implement D-Bus interface {interface}"
+            )
+        info = infos[interface]
+
+        properties_with_values = {}
+        invalidated_properties = []
+        for prop_name in properties:
+            if prop_name not in info:
+                raise TypeError(
+                    f"The D-Bus interface {interface} does not define a property {prop_name}"
+                )
+            if info[prop_name][1].emit_changed:
+                if info[prop_name][1].emit_with_value:
+                    properties_with_values[prop_name] = on_get_property(
+                        obj,
+                        obj.__giodbustemplate__connection__,
+                        "",
+                        obj.__giodbustemplate__path__,
+                        interface,
+                        prop_name,
+                    )
+                else:
+                    invalidated_properties.append(prop_name)
+
+        emit_properties_changed(
+            obj, interface, properties_with_values, invalidated_properties
+        )
 
     def __init__(
         self,
@@ -554,9 +630,6 @@ class DBusTemplate:
         unassigned_signals = set(collect_unassigned(infos_signals))
         unassigned_properties = set(collect_unassigned(infos_properties))
 
-        # This dict keeps track of "open" properties: properties where we have found a getter or setter but not both.
-        open_props: _OpenPropsType = {}
-
         # Collect methods, signals, property handler methods in cls
         for attr_name, member in cls.__dict__.items():
             if isinstance(member, DBusHandlerStandIn):
@@ -577,52 +650,31 @@ class DBusTemplate:
                         unique_signals,
                         infos_signals,
                     )
-                    # For signals we replace the method itself with a special proxy partial
+                    # For signals, we replace the method itself with a special proxy partial method
                     setattr(
                         cls,
                         attr_name,
-                        # handle_signal_method will get self as the first argument,
-                        # it will then get all the parameters defined below
-                        # and then the additional arguments of the call itself.
-                        partialmethod(
-                            handle_signal_method,
-                            infos_signals[interface_name][member.name],
+                        update_wrapper(
+                            partialmethod(
+                                handle_signal_method,
+                                infos_signals[interface_name][member.name],
+                                member.func,
+                                interface_name,
+                            ),
                             member.func,
-                            interface_name,
                         ),
                     )
                 else:
-                    assert (
-                        member.type == "property_set" or member.type == "property_get"
-                    )
-                    process_standin(
+                    assert member.type == "property"
+                    interface_name = process_standin(
                         member,
                         unassigned_properties,
                         unique_properties,
                         infos_properties,
                         def_properties,
-                        open_props,
                     )
-                    # Replace method again with actual method
-                    setattr(cls, attr_name, member.func)
-
-        # Validate that all are accounted for and generate default setters
-        open_pros_iter = iter(open_props.items())
-        for (interface_name, prop_name), existing_standin in open_pros_iter:
-            if existing_standin.type == "property_get":
-                # Insert default setter
-                info = infos_properties[interface_name][existing_standin.name]
-                def_properties[interface_name][existing_standin.name] = (
-                    info,
-                    existing_standin.func,
-                    not_supported_setter,
-                )
-                unassigned_properties.remove((interface_name, existing_standin.name))
-            else:
-                assert existing_standin.type == "property_set"
-                raise TypeError(
-                    f"Missing getter for interface property '{prop_name}' from interface '{interface_name}'"
-                )
+                    # We don't replace the standin, the standin is a descriptor that will handle everything.
+                    member.interface = interface_name
 
         if len(unassigned_methods) > 0:
             interface_name, method_name = next(iter(unassigned_methods))
