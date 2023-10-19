@@ -1,0 +1,156 @@
+using Gtk 4.0;
+
+template $PlayerWindow: Window {
+    realize => $on_realize();
+
+    default-width: 1400;
+    default-height: 600;
+
+    Box {
+        orientation: horizontal;
+
+        // left
+        Box {
+            orientation: vertical;
+            hexpand: true;
+
+            Label {
+                label: "Current Tracklist\n(one per line)";
+                wrap-mode: word;
+            }
+            ScrolledWindow {
+                vexpand: true;
+                TextView tracklist {
+                    monospace: true;
+                    buffer: TextBuffer tracklist_buff {
+                        changed => $on_tracklist_changed();
+                        text: "dummy://one?artist=Foo&track=Bar\ndummy://two?artist=GNOME&track=Desktop";
+                    };
+                }
+            }
+            Box {
+                orientation: horizontal;
+                halign: center;
+
+                Label {
+                    label: "Parsing: ";
+                }
+                Label parse_state_tracklist {
+                    label: "...";
+                }
+            }
+        }
+
+        // center
+        Box {
+            orientation: vertical;
+
+            Box {
+                orientation: vertical;
+                halign: center;
+
+                Label {
+                    label: "Current Track: ";
+                }
+                Label current_track_lbl {
+                    label: "...";
+                }
+            }
+
+            Box {
+                orientation: horizontal;
+                halign: center;
+
+                Label {
+                    label: "State: ";
+                }
+                Label state {
+                    label: "...";
+                }
+            }
+
+            Scale seeker {
+                change-value => $on_seeker_change_value();
+                orientation: horizontal;
+                digits: 0;
+                draw-value: true;
+                value-pos: left;
+                adjustment: Adjustment {
+                    lower: 0;
+                    upper: 240;
+                };
+            }
+
+            Box {
+                orientation: horizontal;
+                halign: center;
+
+                Button play_pause {
+                    clicked => $on_play_pause_clicked();
+                    label: "P/P";
+                }
+
+                Button stop {
+                    clicked => $on_stop_clicked();
+                    label: "Stop";
+                }
+
+                Button next {
+                    clicked => $on_next_clicked();
+                    label: "Next";
+                }
+
+                Button prev {
+                    clicked => $on_prev_clicked();
+                    label: "Prev";
+                }
+            }
+
+            Box {
+                Label {
+                    label: "Play other (# in TL):";
+                }
+                Entry switch_track_id {
+                    max-length: 3;
+                    text: "0";
+                }
+                Button submit_switch_track_id {
+                    clicked => $on_submit_switch_track_id_clicked();
+                    label: "GO";
+                }
+            }
+        }
+
+        // right
+        Box {
+            orientation: vertical;
+            hexpand: true;
+
+            Label {
+                label: "Playlists (YAML)";
+                wrap-mode: word;
+            }
+            ScrolledWindow {
+                vexpand: true;
+                TextView {
+                    monospace: true;
+                    buffer: TextBuffer playlists_buff {
+                        changed => $on_playlists_changed();
+                        text: " -\n    name: Playlist 1\n    tracks:\n      - dummy://one?artist=Foo&track=Bar\n      - dummy://two?artist=GNOME&track=Desktop\n - \n    name: Playlist 2\n    tracks:\n        - dummy://three?artist=Baz&track=Python\n        - dummy://four?artist=Baz&track=Blueprint";
+                    };
+                }
+            }
+            Box {
+                orientation: horizontal;
+                halign: center;
+
+                Label {
+                    label: "Parsing: ";
+                }
+                Label parse_state_playlists {
+                    label: "...";
+                }
+            }
+        }
+    }
+}

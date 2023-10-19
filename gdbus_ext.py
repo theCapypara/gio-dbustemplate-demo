@@ -5,7 +5,6 @@ This is temporary and will be contributed to PyGObject.
 from __future__ import annotations
 
 import os
-import sys
 import traceback
 from functools import partial, partialmethod, update_wrapper
 from typing import (
@@ -286,11 +285,7 @@ def on_method_call(
         result = method_func(obj, *args)
     except Exception as e:
         invocation.return_dbus_error(interface_name, str(e))
-        # If a debugger is attached, re-raise the Exception.
-        if getattr(sys, "gettrace", None) is not None:
-            raise e
-        else:
-            traceback.print_exc()
+        traceback.print_exc()
         return
 
     if not isinstance(result, tuple):
