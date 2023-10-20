@@ -4,8 +4,6 @@ from urllib.parse import urlparse, parse_qs
 
 from gi.repository import Gtk, GObject
 
-from gdbus_ext import DBusTemplate
-
 
 class Track(TypedDict):
     uri: str
