@@ -2,7 +2,7 @@
 
 This is an example for an implementation for "Gio.DBusTemplate" for PyGObject.
 
-See merge request: -link here-
+See merge request: https://gitlab.gnome.org/GNOME/pygobject/-/merge_requests/263
 
 Run `main.py` for an example "music player" that implements MPRIS2 using "Gio.DBusTemplate" 
 (it doesn't actually play music).
